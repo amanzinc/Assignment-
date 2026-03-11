@@ -1,1 +1,10 @@
 *.crdownload
+Dataset/
+Dataset.zip
+.venv/
+__pycache__/
+*.pyc
+frame1.png
+frame2.png
+extract_frames.py
+__MACOSX/

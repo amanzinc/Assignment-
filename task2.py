@@ -68,12 +68,24 @@ def nonlinear_refinement(X_init, P1, P2, pts1, pts2, max_nfev=10):
     """
     X_flat_init = X_init.flatten()
     
+    # Create the block diagonal sparsity structure for the jacobian
+    # There are 2 views * 2 coordinates = 4 residuals per 3D point
+    from scipy.sparse import lil_matrix
+    N = len(X_init)
+    A = lil_matrix((4 * N, 3 * N), dtype=int)
+    for i in range(N):
+        A[i*2:(i*2)+2, i*3:(i*3)+3] = 1         # 2 residuals from View 1 depend on 3 params of point i
+        A[(2*N)+i*2:(2*N)+(i*2)+2, i*3:(i*3)+3] = 1 # 2 residuals from View 2 depend on 3 params of point i
+        
     res = least_squares(
         reprojection_residuals, 
         X_flat_init, 
         args=(P1, P2, pts1, pts2),
-        method='lm',       # Levenberg-Marquardt
-        max_nfev=max_nfev  # Hard limit on iterations/evaluations
+        method='trf',      # Trust Region Reflective (faster for large scale)
+        jac_sparsity=A,    # CRUCIAL: Makes it run in < 1 second instead of hours
+        ftol=1e-15,         
+        xtol=1e-15,
+        max_nfev=max_nfev 
     )
     
     X_refined = res.x.reshape((len(X_init), 3))
@@ -126,7 +138,7 @@ def plot_3d_points(X_init, X_refined):
     # Initial
     ax1 = fig.add_subplot(121, projection='3d')
     if X_init is not None and len(X_init) > 0:
-        ax1.scatter(X_init[:, 0], X_init[:, 1], X_init[:, 2], c='r', marker='o', s=5)
+        ax1.scatter(X_init[:, 0], X_init[:, 1], X_init[:, 2], c='r', marker='o', s=15, alpha=0.7) # Increased size and added alpha
     ax1.set_title('3D Points (Initial Linear Triangulation)')
     ax1.set_xlabel('X')
     ax1.set_ylabel('Y')
@@ -135,7 +147,7 @@ def plot_3d_points(X_init, X_refined):
     # Refined
     ax2 = fig.add_subplot(122, projection='3d')
     if X_refined is not None and len(X_refined) > 0:
-        ax2.scatter(X_refined[:, 0], X_refined[:, 1], X_refined[:, 2], c='g', marker='^', s=5)
+        ax2.scatter(X_refined[:, 0], X_refined[:, 1], X_refined[:, 2], c='g', marker='^', s=15, alpha=0.7) # Increased size and added alpha
     ax2.set_title('3D Points (Non-linear Refinement)')
     ax2.set_xlabel('X')
     ax2.set_ylabel('Y')
@@ -144,7 +156,7 @@ def plot_3d_points(X_init, X_refined):
     plt.tight_layout()
     plt.savefig('task2_3d_reconstruction.png')
     print("Saved 3D plot to task2_3d_reconstruction.png")
-    plt.show()
+    # plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description="Task 2: Triangulation and Pose Recovery")

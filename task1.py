@@ -136,8 +136,8 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F1, F2):
             color = tuple(np.random.randint(0, 255, 3).tolist())
             x0, y0 = map(int, [0, -r[2]/r[1] ])
             x1, y1 = map(int, [w, -(r[2]+r[0]*w)/r[1] ])
-            img_out = cv2.line(img_out, (x0, y0), (x1, y1), color, 1)
-            img_out = cv2.circle(img_out, tuple(map(int, pt)), 5, color, -1)
+            img_out = cv2.line(img_out, (x0, y0), (x1, y1), color, 5) # Further increased thickness to 5
+            img_out = cv2.circle(img_out, tuple(map(int, pt)), 12, color, -1) # Further increased radius to 12
         return img_out
 
     img_lines1 = draw_lines_on_image(img2_color, lines1, rand_pts2, "Epipolar Lines (E1: All points)")
@@ -154,7 +154,7 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F1, F2):
     plt.tight_layout()
     plt.savefig('epipolar_lines_comparison.png')
     print("Saved epipolar lines comparison to epipolar_lines_comparison.png")
-    plt.show()
+    # plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description="Task 1: Feature Correspondence and Essential Matrix Estimation")
