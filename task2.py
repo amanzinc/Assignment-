@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 import argparse
+import time
 from scipy.optimize import least_squares
+from scipy.sparse import kron, eye as speye
 import matplotlib.pyplot as plt
 
 # Import necessary functions from Task 1
@@ -65,98 +67,101 @@ def reprojection_residuals(X_flat, P1, P2, pts1, pts2):
 def nonlinear_refinement(X_init, P1, P2, pts1, pts2, max_nfev=10):
     """
     Refines 3D points by minimizing reprojection error over all observing views.
+    Uses a vectorized sparse Jacobian pattern (no Python loops) for speed.
     """
     X_flat_init = X_init.flatten()
-    
-    # Create the block diagonal sparsity structure for the jacobian
-    # There are 2 views * 2 coordinates = 4 residuals per 3D point
-    from scipy.sparse import lil_matrix
     N = len(X_init)
-    A = lil_matrix((4 * N, 3 * N), dtype=int)
-    for i in range(N):
-        A[i*2:(i*2)+2, i*3:(i*3)+3] = 1         # 2 residuals from View 1 depend on 3 params of point i
-        A[(2*N)+i*2:(2*N)+(i*2)+2, i*3:(i*3)+3] = 1 # 2 residuals from View 2 depend on 3 params of point i
-        
+
+    # Block-diagonal sparsity: each 3D point has 4 residuals (2 per view)
+    # and 3 parameters. kron builds this in one vectorised call.
+    A = kron(speye(N, format='csr', dtype=np.int8), np.ones((4, 3), dtype=np.int8))
+
     res = least_squares(
-        reprojection_residuals, 
-        X_flat_init, 
+        reprojection_residuals,
+        X_flat_init,
         args=(P1, P2, pts1, pts2),
-        method='trf',      # Trust Region Reflective (faster for large scale)
-        jac_sparsity=A,    # CRUCIAL: Makes it run in < 1 second instead of hours
-        ftol=1e-15,         
+        method='trf',
+        jac_sparsity=A,
+        ftol=1e-15,
         xtol=1e-15,
-        max_nfev=max_nfev 
+        max_nfev=max_nfev
     )
-    
-    X_refined = res.x.reshape((len(X_init), 3))
+
+    X_refined = res.x.reshape((N, 3))
     return X_refined
 
 def disambiguate_pose(pairs, K, pts1, pts2):
     """
     Selects the correct (R, t) pair using the Cheirality condition (Z > 0 in both cameras).
+    Prints all 4 candidate poses and their cheirality counts.
     """
     P1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
-    
+
     best_pair_idx = -1
     max_positive_depths = -1
     best_X = None
     best_P2 = None
-    
-    print("Evaluating the 4 candidate poses:")
+
+    print("\n--- 4 Candidate (R, t) Pairs from Essential Matrix Decomposition ---")
     for i, (R, t) in enumerate(pairs):
         P2 = K @ np.hstack((R, t))
-        
-        # Triangulate
         X = linear_triangulation(P1, P2, pts1, pts2)
-        
-        # Calculate depth in Camera 1
+
         depth1 = X[:, 2]
-        
-        # Calculate depth in Camera 2
         X_c2 = (R @ X.T) + t
         depth2 = X_c2[2, :]
-        
-        # Condition: Z > 0 in both cameras
-        valid_points = np.sum((depth1 > 0) & (depth2 > 0))
-        
-        print(f"  Pose {i+1}: Valid points (Z > 0) = {valid_points} / {len(X)}")
-        
+        valid_points = int(np.sum((depth1 > 0) & (depth2 > 0)))
+
+        print(f"\n  Pose {i+1}:")
+        print(f"    R =\n{np.array2string(R, prefix='      ', precision=6)}")
+        print(f"    t = {t.flatten()}")
+        print(f"    Points with Z>0 in both cameras: {valid_points} / {len(X)}")
+
         if valid_points > max_positive_depths:
             max_positive_depths = valid_points
             best_pair_idx = i
             best_X = X
             best_P2 = P2
-            
+
+    print(f"\n  → Selected Pose {best_pair_idx + 1} "
+          f"(max positive-depth points: {max_positive_depths} / {len(pts1)})")
     return pairs[best_pair_idx], best_X, P1, best_P2
 
 def plot_3d_points(X_init, X_refined):
     """
-    Plots the 3D point cloud before and after refinement.
+    Plots 3D point cloud before and after non-linear refinement.
+    Also renders a small OpenCV window for live demo.
     """
     fig = plt.figure(figsize=(12, 6))
-    
-    # Initial
+
     ax1 = fig.add_subplot(121, projection='3d')
     if X_init is not None and len(X_init) > 0:
-        ax1.scatter(X_init[:, 0], X_init[:, 1], X_init[:, 2], c='r', marker='o', s=15, alpha=0.7) # Increased size and added alpha
-    ax1.set_title('3D Points (Initial Linear Triangulation)')
-    ax1.set_xlabel('X')
-    ax1.set_ylabel('Y')
-    ax1.set_zlabel('Z')
-    
-    # Refined
+        step = max(1, len(X_init) // 3000)   # cap scatter points for render speed
+        ax1.scatter(X_init[::step, 0], X_init[::step, 1], X_init[::step, 2],
+                    c='r', marker='o', s=8, alpha=0.6)
+    ax1.set_title('Initial (Linear Triangulation)')
+    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+
     ax2 = fig.add_subplot(122, projection='3d')
     if X_refined is not None and len(X_refined) > 0:
-        ax2.scatter(X_refined[:, 0], X_refined[:, 1], X_refined[:, 2], c='g', marker='^', s=15, alpha=0.7) # Increased size and added alpha
-    ax2.set_title('3D Points (Non-linear Refinement)')
-    ax2.set_xlabel('X')
-    ax2.set_ylabel('Y')
-    ax2.set_zlabel('Z')
-    
+        step = max(1, len(X_refined) // 3000)
+        ax2.scatter(X_refined[::step, 0], X_refined[::step, 1], X_refined[::step, 2],
+                    c='g', marker='^', s=8, alpha=0.6)
+    ax2.set_title('After Non-linear Refinement')
+    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+
     plt.tight_layout()
-    plt.savefig('task2_3d_reconstruction.png')
-    print("Saved 3D plot to task2_3d_reconstruction.png")
-    # plt.show()
+    plt.savefig('task2_3d_reconstruction.png', dpi=150)
+    print("Saved task2_3d_reconstruction.png")
+
+    # Render to numpy array and show in cv2 window for live demo
+    fig.canvas.draw()
+    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    cv2.imshow('Task 2 – 3D Reconstruction (before / after refinement)',
+               cv2.cvtColor(buf, cv2.COLOR_RGB2BGR))
+    cv2.waitKey(1)
+    plt.close(fig)
 
 def main():
     parser = argparse.ArgumentParser(description="Task 2: Triangulation and Pose Recovery")
@@ -164,53 +169,75 @@ def main():
     parser.add_argument("image2", help="Path to second image")
     args = parser.parse_args()
 
-    print("Running Task 1 Feature Detection...")
-    kp1, des1, kp2, des2, good_matches, pts1, pts2, img1, img2 = extract_features_and_match(args.image1, args.image2)
+    print("=" * 60)
+    print("Task 2: Triangulation and Pose Recovery")
+    print("=" * 60)
+
+    # ─ Feature detection & matching (Task 1 reuse) ─
+    t0 = time.perf_counter()
+    kp1, des1, kp2, des2, good_matches, pts1, pts2, img1, img2 = \
+        extract_features_and_match(args.image1, args.image2)
     K = get_camera_intrinsics(img1.shape)
-    
-    # We use E2 (RANSAC) and its mask to use only inliers for pose recovery and triangulation
     E1, E2, mask = estimate_essential_matrices(pts1, pts2, K)
-    
-    # Filter points to only include inliers from Essential matrix estimation
+    t_feat = time.perf_counter() - t0
+    print(f"\nFeature detection + matching + E estimation: {t_feat*1000:.1f} ms  "
+          f"(~{1/t_feat:.1f} FPS)")
+
     inlier_mask = mask.ravel() == 1
     pts1_inliers = pts1[inlier_mask]
     pts2_inliers = pts2[inlier_mask]
-    
-    print(f"Using {len(pts1_inliers)} inlier correspondences for Task 2.")
+    print(f"Using {len(pts1_inliers)} inlier correspondences.")
 
-    # 2. Pose Decomposition
+    # ─ 1. Pose Decomposition ─
+    t0 = time.perf_counter()
     pairs = decompose_essential_matrix(E2)
-    
-    # 3. Pose Disambiguation (Cheirality) and Linear Triangulation
+
+    # ─ 2 & 4. Linear Triangulation + Cheirality Disambiguation ─
     best_pair, X_init, P1, P2 = disambiguate_pose(pairs, K, pts1_inliers, pts2_inliers)
     best_R, best_t = best_pair
-    
-    print(f"\nSelected Candidate Pose:")
-    print(f"R = \n{best_R}")
-    print(f"t = \n{best_t}")
+    t_tri = time.perf_counter() - t0
 
-    # 4. Calculate initial reprojection error
+    print(f"\n  Triangulation + disambiguation time: {t_tri*1000:.1f} ms")
+    print(f"\nFinal Selected Pose:")
+    print(f"  R =\n{best_R}")
+    print(f"  t = {best_t.flatten()}")
+
+    # ─ 3. Reprojection error BEFORE refinement ─
     err1_init = compute_reprojection_error(X_init, P1, pts1_inliers)
     err2_init = compute_reprojection_error(X_init, P2, pts2_inliers)
-    mean_err_init = np.mean([np.linalg.norm(err1_init.reshape(-1, 2), axis=1), 
-                             np.linalg.norm(err2_init.reshape(-1, 2), axis=1)])
-    
-    print(f"\nInitial Average Reprojection Error: {mean_err_init:.4f} pixels")
+    errs_init = np.concatenate([
+        np.linalg.norm(err1_init.reshape(-1, 2), axis=1),
+        np.linalg.norm(err2_init.reshape(-1, 2), axis=1)
+    ])
+    print(f"\nReprojection Error (before refinement):")
+    print(f"  Mean : {errs_init.mean():.4f} px")
+    print(f"  Std  : {errs_init.std():.4f} px")
+    print(f"  Max  : {errs_init.max():.4f} px")
 
-    # 5. Nonlinear Refinement
-    print("Running non-linear refinement (10 iterations)...")
+    # ─ 3. Nonlinear Refinement (fixed 10 iterations, no early stopping) ─
+    print("\nRunning non-linear refinement (10 iterations, no early stopping)...")
+    t0 = time.perf_counter()
     X_refined = nonlinear_refinement(X_init, P1, P2, pts1_inliers, pts2_inliers, max_nfev=10)
-    
-    # Calculate refined reprojection error
+    t_ref = time.perf_counter() - t0
+
     err1_ref = compute_reprojection_error(X_refined, P1, pts1_inliers)
     err2_ref = compute_reprojection_error(X_refined, P2, pts2_inliers)
-    mean_err_ref = np.mean([np.linalg.norm(err1_ref.reshape(-1, 2), axis=1), 
-                            np.linalg.norm(err2_ref.reshape(-1, 2), axis=1)])
-                            
-    print(f"Refined Average Reprojection Error: {mean_err_ref:.4f} pixels")
-    
-    # 6. Plot the 3D results
+    errs_ref = np.concatenate([
+        np.linalg.norm(err1_ref.reshape(-1, 2), axis=1),
+        np.linalg.norm(err2_ref.reshape(-1, 2), axis=1)
+    ])
+    print(f"Reprojection Error (after refinement):")
+    print(f"  Mean : {errs_ref.mean():.4f} px")
+    print(f"  Std  : {errs_ref.std():.4f} px")
+    print(f"  Max  : {errs_ref.max():.4f} px")
+    print(f"  Refinement time: {t_ref*1000:.1f} ms")
+
+    # ─ Visualisation ─
     plot_3d_points(X_init, X_refined)
+
+    print("\nPress any key in the OpenCV windows to close them.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

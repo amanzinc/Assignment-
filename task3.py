@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 # Import necessary functions from Task 1 and Task 2
 from task1 import extract_features_and_match, get_camera_intrinsics
-from task2 import linear_triangulation, compute_reprojection_error, maximize_cheirality_check, convert_hom_to_3d
+from task2 import linear_triangulation, compute_reprojection_error, disambiguate_pose
 
 # We need some helper functions from task2 but they might not be exposed directly in a way we can use easily
 # So I will re-implement or adapt slightly for the map structure.
@@ -59,7 +59,41 @@ class SfMMap:
         if frame_idx not in self.registered_cameras:
             return None
         R, t = self.registered_cameras[frame_idx]
+        if R is None or t is None:
+            return None
         return self.K @ np.hstack((R, t))
+
+    def compute_global_reprojection_error(self):
+        total_error = 0.0
+        total_obs = 0
+        from task2 import compute_reprojection_error
+        
+        # Group points by camera to compute errors efficiently
+        points_by_cam = {}
+        for pt_idx, obs_list in enumerate(self.point_observations):
+            for frame_idx, kp_idx in obs_list:
+                if frame_idx not in points_by_cam:
+                    points_by_cam[frame_idx] = {'pts3d': [], 'pts2d': []}
+                points_by_cam[frame_idx]['pts3d'].append(self.points_3d[pt_idx])
+                # We need the actual 2D coordinates
+                kp = self.frame_data[frame_idx]['kp'][kp_idx].pt
+                points_by_cam[frame_idx]['pts2d'].append(kp)
+                
+        for frame_idx, data in points_by_cam.items():
+            P = self.get_camera_projection_matrix(frame_idx)
+            if P is None: continue
+            
+            pts3d = np.array(data['pts3d'])
+            pts2d = np.array(data['pts2d'])
+            
+            err = compute_reprojection_error(pts3d, P, pts2d)
+            # err is a 1D array of size 2*N
+            err_norms = np.linalg.norm(err.reshape(-1, 2), axis=1)
+            total_error += np.sum(err_norms)
+            total_obs += len(pts3d)
+            
+        if total_obs == 0: return 0.0
+        return total_error / total_obs
 
 
 def pose_reprojection_residuals(params, points_3d, points_2d, K):
@@ -125,17 +159,56 @@ def load_frames(dataset_path):
     return files
 
 def match_features_knn(des1, des2, ratio=0.75):
-    bf = cv2.BFMatcher()
-    matches = bf.knnMatch(des1, des2, k=2)
+    # Use FLANN matching for speed
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+    
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    matches = flann.knnMatch(des1, des2, k=2)
+    
     good = []
     for m, n in matches:
         if m.distance < ratio * n.distance:
             good.append(m)
     return good
 
+def update_live_plot(sfm_map, ax, fig):
+    ax.clear()
+    pts = np.array(sfm_map.points_3d)
+    cams = []
+    for idx in sfm_map.frame_indices:
+        if sfm_map.registered_cameras.get(idx, (None, None))[0] is None:
+            continue
+        R, t = sfm_map.registered_cameras[idx]
+        C = -R.T @ t
+        cams.append(C.flatten())
+    cams = np.array(cams)
+    
+    if len(pts) > 0:
+        step = max(1, len(pts) // 5000)
+        ax.scatter(pts[::step, 0], pts[::step, 1], pts[::step, 2], s=1, c='b', label='Structure')
+        
+    if len(cams) > 0:
+        ax.scatter(cams[:, 0], cams[:, 1], cams[:, 2], s=20, c='r', marker='^', label='Cameras')
+        ax.plot(cams[:, 0], cams[:, 1], cams[:, 2], c='r', alpha=0.5)
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    
+    valid_cams = sum(1 for R, t in sfm_map.registered_cameras.values() if R is not None)
+    ax.set_title(f'Incremental SfM Map\nPoints: {len(pts)} | Cameras: {valid_cams}')
+    plt.pause(0.01)
+
 def run_incremental_sfm(image_files, K):
     # Initialize Map
     sfm_map = SfMMap(K)
+    
+    # Initialize live plotting
+    plt.ion()
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
     
     # Process First Two Frames (Initialization)
     print(f"Initializing with Frame 0 and Frame 1: {image_files[0]}, {image_files[1]}")
@@ -188,6 +261,10 @@ def run_incremental_sfm(image_files, K):
         count_added += 1
         
     print(f"Initialization complete. Map has {count_added} points.")
+    update_live_plot(sfm_map, ax, fig)
+    mean_err = sfm_map.compute_global_reprojection_error()
+    print(f"  System State: 2 cameras, {len(sfm_map.points_3d)} points")
+    print(f"  Global Mean Reprojection Error: {mean_err:.4f} pixels")
     
     # Incremental Loop
     for i in range(2, len(image_files)):
@@ -369,9 +446,15 @@ def run_incremental_sfm(image_files, K):
                     new_pts_count += 1
         
         print(f"  Added {new_pts_count} new 3D points.")
-        print(f"  Total Map Size: {len(sfm_map.points_3d)} points.")
-        print(f"  Total Registered Cameras: {len(sfm_map.registered_cameras)}")
+        
+        valid_cams = sum(1 for R, t in sfm_map.registered_cameras.values() if R is not None)
+        mean_err = sfm_map.compute_global_reprojection_error()
+        print(f"  System State: {valid_cams} cameras, {len(sfm_map.points_3d)} points")
+        print(f"  Global Mean Reprojection Error: {mean_err:.4f} pixels")
+        
+        update_live_plot(sfm_map, ax, fig)
 
+    plt.ioff()
     return sfm_map
 
 def visualize_map(sfm_map):
@@ -403,7 +486,7 @@ def visualize_map(sfm_map):
     ax.legend()
     plt.savefig('task3_map.png')
     print("Saved map visualization to task3_map.png")
-    # plt.show()
+    plt.show() # Added to keep final plot open
 
 def main():
     parser = argparse.ArgumentParser(description="Task 3: Incremental Mapping")
