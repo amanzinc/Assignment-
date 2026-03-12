@@ -123,50 +123,56 @@ def disambiguate_pose(pairs, K, pts1, pts2):
             best_X = X
             best_P2 = P2
 
-    print(f"\n  → Selected Pose {best_pair_idx + 1} "
+    print(f"\n  -> Selected Pose {best_pair_idx + 1} "
           f"(max positive-depth points: {max_positive_depths} / {len(pts1)})")
     return pairs[best_pair_idx], best_X, P1, best_P2
 
-def plot_3d_points(X_init, X_refined):
+def plot_3d_points(X_init, X_refined, output_path='task2_3d_reconstruction.png'):
     """
     Plots 3D point cloud before and after non-linear refinement.
-    Also renders a small OpenCV window for live demo.
     """
-    fig = plt.figure(figsize=(12, 6))
+    fig = plt.figure(figsize=(14, 7))
+    fig.suptitle('Sparse 3D Point Cloud \u2014 Task 2', fontsize=14, fontweight='bold')
 
-    ax1 = fig.add_subplot(121, projection='3d')
-    if X_init is not None and len(X_init) > 0:
-        step = max(1, len(X_init) // 3000)   # cap scatter points for render speed
-        ax1.scatter(X_init[::step, 0], X_init[::step, 1], X_init[::step, 2],
-                    c='r', marker='o', s=8, alpha=0.6)
-    ax1.set_title('Initial (Linear Triangulation)')
-    ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+    for col, (X, color, subtitle) in enumerate([
+        (X_init,    '#4C8BE2', 'Before Refinement'),
+        (X_refined, '#E87D2B', 'After Refinement'),
+    ]):
+        ax = fig.add_subplot(1, 2, col + 1, projection='3d')
+        ax.set_title(subtitle, fontsize=11)
 
-    ax2 = fig.add_subplot(122, projection='3d')
-    if X_refined is not None and len(X_refined) > 0:
-        step = max(1, len(X_refined) // 3000)
-        ax2.scatter(X_refined[::step, 0], X_refined[::step, 1], X_refined[::step, 2],
-                    c='g', marker='^', s=8, alpha=0.6)
-    ax2.set_title('After Non-linear Refinement')
-    ax2.set_xlabel('X'); ax2.set_ylabel('Y'); ax2.set_zlabel('Z')
+        if X is not None and len(X) > 0:
+            step = max(1, len(X) // 3000)
+            n_shown = len(X[::step])
+            ax.scatter(X[::step, 0], X[::step, 1], X[::step, 2],
+                       c=color, marker='o', s=2, alpha=0.7,
+                       label=f'{n_shown} pts')
+
+        # Camera 1 at origin — green dot
+        ax.scatter([0], [0], [0], c='green', s=60, zorder=5)
+
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.legend(loc='upper left', markerscale=4, fontsize=9, framealpha=0.7)
 
     plt.tight_layout()
-    plt.savefig('task2_3d_reconstruction.png', dpi=150)
-    print("Saved task2_3d_reconstruction.png")
-
-    # Render to numpy array and show in cv2 window for live demo
-    fig.canvas.draw()
-    buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    buf = buf.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    cv2.imshow('Task 2 – 3D Reconstruction (before / after refinement)',
-               cv2.cvtColor(buf, cv2.COLOR_RGB2BGR))
-    cv2.waitKey(1)
+    plt.savefig(output_path, dpi=150)
+    print(f"Saved {output_path}")
     plt.close(fig)
+
+    # Show the saved image in an OpenCV window for live demo
+    buf = cv2.imread(output_path)
+    if buf is not None:
+        cv2.imshow('Task 2 \u2013 3D Reconstruction (before / after refinement)', buf)
+        cv2.waitKey(1)
 
 def main():
     parser = argparse.ArgumentParser(description="Task 2: Triangulation and Pose Recovery")
     parser.add_argument("image1", help="Path to first image")
     parser.add_argument("image2", help="Path to second image")
+    parser.add_argument("--output", default="task2_3d_reconstruction.png",
+                        help="Output PNG filename (default: task2_3d_reconstruction.png)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -233,7 +239,7 @@ def main():
     print(f"  Refinement time: {t_ref*1000:.1f} ms")
 
     # ─ Visualisation ─
-    plot_3d_points(X_init, X_refined)
+    plot_3d_points(X_init, X_refined, args.output)
 
     print("\nPress any key in the OpenCV windows to close them.")
     cv2.waitKey(0)

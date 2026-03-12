@@ -209,9 +209,9 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F1, F2, inlier_mask):
     print(f"  E1 (8-point, all points) : {sd1:.6f}")
     print(f"  E2 (RANSAC)              : {sd2:.6f}")
     if sd2 < sd1:
-        print(f"  → E2 is {ratio:.1f}x better at satisfying the epipolar constraint.")
+        print(f"  -> E2 is {ratio:.1f}x better at satisfying the epipolar constraint.")
     else:
-        print(f"  → E1 has lower Sampson distance on inliers (ratio {ratio:.2f}).")
+        print(f"  -> E1 has lower Sampson distance on inliers (ratio {ratio:.2f}).")
         print(f"     Note: RANSAC robustness is its key advantage — it rejects outliers.")
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 7))
