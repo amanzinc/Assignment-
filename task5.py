@@ -1,5 +1,5 @@
 import argparse
-import glob
+import gc
 import json
 import os
 import sqlite3
@@ -14,6 +14,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial import cKDTree
 
+try:
+    import pycolmap
+except Exception:
+    pycolmap = None
+
 
 SCENES = ["barn", "meetingroom", "truck"]
 
@@ -23,6 +28,18 @@ class ColmapModel:
     cameras_txt: Path
     images_txt: Path
     points3d_txt: Path
+
+
+@dataclass
+class PipelineSummary:
+    name: str
+    points: np.ndarray
+    camera_centers: np.ndarray
+    mean_reprojection_error: float
+    chamfer_distance: float
+    num_points: int
+    num_cameras: int
+    pose_lookup: Dict[str, List[float]]
 
 
 def camera_intrinsics_from_image(image_path: Path) -> Tuple[float, float, float, float]:
@@ -44,8 +61,24 @@ def run_cmd(cmd: List[str]) -> None:
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
 
 
-def ensure_frames_for_scene(scene: str, split_a_dir: Path, frames_root: Path, stride: int) -> Path:
-    out_dir = frames_root / f"split_a_{scene}_frames"
+def ensure_frames_for_scene(
+    scene: str,
+    split_a_dir: Path,
+    frames_root: Path,
+    stride: int,
+    max_output_frames: int = 0,
+    force_extract_frames: bool = False,
+) -> Path:
+    # Reuse pre-extracted frames if they already exist in workspace root.
+    if not force_extract_frames:
+        workspace_frames = split_a_dir.parent.parent / f"split_a_{scene}_frames"
+        if workspace_frames.exists():
+            existing_ws = sorted(workspace_frames.glob("*.png"))
+            if len(existing_ws) >= 2:
+                return workspace_frames
+
+    dir_suffix = f"split_a_{scene}_frames_s{max(1, int(stride))}"
+    out_dir = frames_root / dir_suffix
     out_dir.mkdir(parents=True, exist_ok=True)
 
     existing = sorted(out_dir.glob("*.png"))
@@ -60,21 +93,77 @@ def ensure_frames_for_scene(scene: str, split_a_dir: Path, frames_root: Path, st
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video: {video_path}")
 
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     written = 0
-    for idx in range(0, frame_count, max(1, int(stride))):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+    stride = max(1, int(stride))
+    frame_idx = 0
+    while True:
         ok, frame = cap.read()
         if not ok:
+            break
+
+        if frame_idx % stride != 0:
+            frame_idx += 1
             continue
-        out_name = out_dir / f"frame_{idx:04d}.png"
+
+        out_name = out_dir / f"frame_{frame_idx:04d}.png"
         cv2.imwrite(str(out_name), frame)
         written += 1
+        if max_output_frames > 0 and written >= max_output_frames:
+            break
+        frame_idx += 1
     cap.release()
 
     if written < 2:
         raise RuntimeError(f"Frame extraction failed for {scene}: only {written} frames written")
     return out_dir
+
+
+def select_image_names(image_dir: Path, max_images: int) -> List[str]:
+    imgs = sorted(image_dir.glob("*.png")) + sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.jpeg"))
+    names = [p.name for p in imgs]
+    if max_images > 0:
+        names = names[:max_images]
+    return names
+
+
+def create_resized_subset(image_dir: Path, output_dir: Path, max_images: int, max_width: int) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for old_file in output_dir.glob("*.png"):
+        old_file.unlink()
+
+    images = sorted(image_dir.glob("*.png")) + sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.jpeg"))
+    if max_images > 0:
+        images = images[:max_images]
+
+    written = 0
+    for idx, src in enumerate(images):
+        img = cv2.imread(str(src), cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+
+        h, w = img.shape[:2]
+        if max_width > 0 and w > max_width:
+            scale = max_width / float(w)
+            new_h = max(1, int(round(h * scale)))
+            img = cv2.resize(img, (max_width, new_h), interpolation=cv2.INTER_AREA)
+
+        out_path = output_dir / f"frame_{idx:04d}.png"
+        cv2.imwrite(str(out_path), img)
+        written += 1
+
+    if written < 2:
+        raise RuntimeError(f"Failed to create resized subset in {output_dir}")
+
+    return output_dir
+
+
+def frame_sort_key(name: str) -> Tuple[int, str]:
+    stem = Path(name).stem
+    digits = "".join(ch for ch in stem if ch.isdigit())
+    if digits:
+        return int(digits), name
+    return 10**9, name
 
 
 def find_colmap_binary(explicit_path: Optional[str]) -> str:
@@ -94,11 +183,25 @@ def find_colmap_binary(explicit_path: Optional[str]) -> str:
     return line
 
 
-def build_colmap_map(
+def build_colmap_map_cli(
     colmap_bin: str,
     image_dir: Path,
     scene_out_dir: Path,
     matcher: str,
+    use_gpu: bool,
+    sequential_overlap: int,
+    min_num_matches: int,
+    init_num_trials: int,
+    mapper_init_min_num_inliers: int,
+    mapper_abs_pose_min_num_inliers: int,
+    mapper_abs_pose_min_inlier_ratio: float,
+    mapper_init_max_error: float,
+    mapper_abs_pose_max_error: float,
+    mapper_filter_max_reproj_error: float,
+    mapper_filter_min_tri_angle: float = 0.5,
+    mapper_ba_local_min_tri_angle: float = 2.0,
+    mapper_init_min_tri_angle: float = 8.0,
+    mapper_max_reg_trials: int = 5,
 ) -> ColmapModel:
     scene_out_dir.mkdir(parents=True, exist_ok=True)
     db_path = scene_out_dir / "database.db"
@@ -128,6 +231,8 @@ def build_colmap_map(
         "PINHOLE",
         "--ImageReader.camera_params",
         camera_params,
+        "--SiftExtraction.use_gpu",
+        "1" if use_gpu else "0",
     ])
 
     if matcher == "sequential":
@@ -136,6 +241,10 @@ def build_colmap_map(
             "sequential_matcher",
             "--database_path",
             str(db_path),
+            "--SiftMatching.use_gpu",
+            "1" if use_gpu else "0",
+            "--SequentialMatching.overlap",
+            str(max(1, int(sequential_overlap))),
         ])
     else:
         run_cmd([
@@ -143,6 +252,8 @@ def build_colmap_map(
             "exhaustive_matcher",
             "--database_path",
             str(db_path),
+            "--SiftMatching.use_gpu",
+            "1" if use_gpu else "0",
         ])
 
     run_cmd([
@@ -154,6 +265,30 @@ def build_colmap_map(
         str(image_dir),
         "--output_path",
         str(sparse_dir),
+        "--Mapper.min_num_matches",
+        str(max(1, int(min_num_matches))),
+        "--Mapper.init_num_trials",
+        str(max(1, int(init_num_trials))),
+        "--Mapper.init_min_num_inliers",
+        str(max(1, int(mapper_init_min_num_inliers))),
+        "--Mapper.abs_pose_min_num_inliers",
+        str(max(1, int(mapper_abs_pose_min_num_inliers))),
+        "--Mapper.abs_pose_min_inlier_ratio",
+        str(float(mapper_abs_pose_min_inlier_ratio)),
+        "--Mapper.init_max_error",
+        str(float(mapper_init_max_error)),
+        "--Mapper.abs_pose_max_error",
+        str(float(mapper_abs_pose_max_error)),
+        "--Mapper.filter_max_reproj_error",
+        str(float(mapper_filter_max_reproj_error)),
+        "--Mapper.filter_min_tri_angle",
+        str(float(mapper_filter_min_tri_angle)),
+        "--Mapper.ba_local_min_tri_angle",
+        str(float(mapper_ba_local_min_tri_angle)),
+        "--Mapper.init_min_tri_angle",
+        str(float(mapper_init_min_tri_angle)),
+        "--Mapper.max_reg_trials",
+        str(max(1, int(mapper_max_reg_trials))),
     ])
 
     candidate_models = sorted([p for p in sparse_dir.glob("*") if p.is_dir()])
@@ -174,6 +309,127 @@ def build_colmap_map(
         "--output_type",
         "TXT",
     ])
+
+    return ColmapModel(
+        cameras_txt=text_dir / "cameras.txt",
+        images_txt=text_dir / "images.txt",
+        points3d_txt=text_dir / "points3D.txt",
+    )
+
+
+def build_colmap_map_pycolmap(
+    image_dir: Path,
+    scene_out_dir: Path,
+    matcher: str,
+    feature_threads: int,
+    max_image_size: int,
+    max_num_features: int,
+    sequential_overlap: int,
+    use_gpu: bool,
+    min_num_matches: int,
+    init_num_trials: int,
+    mapper_init_min_num_inliers: int,
+    mapper_abs_pose_min_num_inliers: int,
+    mapper_abs_pose_min_inlier_ratio: float,
+    mapper_init_max_error: float,
+    mapper_abs_pose_max_error: float,
+    mapper_filter_max_reproj_error: float,
+    mapper_filter_min_tri_angle: float = 0.5,
+    mapper_ba_local_min_tri_angle: float = 2.0,
+    mapper_init_min_tri_angle: float = 8.0,
+    mapper_max_reg_trials: int = 5,
+    image_names: Optional[List[str]] = None,
+) -> ColmapModel:
+    if pycolmap is None:
+        raise RuntimeError("pycolmap is not installed. Install it or use --backend colmap.")
+
+    scene_out_dir.mkdir(parents=True, exist_ok=True)
+    db_path = scene_out_dir / "database.db"
+    sparse_dir = scene_out_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+
+    images = sorted(image_dir.glob("*.png")) + sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.jpeg"))
+    if len(images) < 2:
+        raise RuntimeError(f"Need at least 2 images in {image_dir}")
+
+    fx, fy, cx, cy = camera_intrinsics_from_image(images[0])
+    camera_params = f"{fx},{fy},{cx},{cy}"
+
+    if db_path.exists():
+        db_path.unlink()
+
+    reader_options = pycolmap.ImageReaderOptions()
+    reader_options.camera_model = "PINHOLE"
+    reader_options.camera_params = camera_params
+
+    extraction_options = pycolmap.FeatureExtractionOptions()
+    extraction_options.num_threads = int(feature_threads)
+    extraction_options.max_image_size = int(max_image_size)
+    extraction_options.use_gpu = bool(use_gpu)
+    extraction_options.sift.max_num_features = int(max_num_features)
+
+    matching_options = pycolmap.FeatureMatchingOptions()
+    matching_options.num_threads = int(feature_threads)
+    matching_options.use_gpu = bool(use_gpu)
+    matching_options.guided_matching = True
+
+    pairing_options = pycolmap.SequentialPairingOptions()
+    pairing_options.overlap = max(1, int(sequential_overlap))
+    pairing_options.num_threads = int(feature_threads)
+
+    mapping_options = pycolmap.IncrementalPipelineOptions()
+    mapping_options.min_num_matches = max(1, int(min_num_matches))
+    mapping_options.init_num_trials = max(1, int(init_num_trials))
+
+    mapper_options = mapping_options.mapper
+    mapper_options.init_min_num_inliers = max(1, int(mapper_init_min_num_inliers))
+    mapper_options.abs_pose_min_num_inliers = max(1, int(mapper_abs_pose_min_num_inliers))
+    mapper_options.abs_pose_min_inlier_ratio = float(mapper_abs_pose_min_inlier_ratio)
+    mapper_options.init_max_error = float(mapper_init_max_error)
+    mapper_options.abs_pose_max_error = float(mapper_abs_pose_max_error)
+    mapper_options.filter_max_reproj_error = float(mapper_filter_max_reproj_error)
+    mapper_options.filter_min_tri_angle = float(mapper_filter_min_tri_angle)
+    mapper_options.ba_local_min_tri_angle = float(mapper_ba_local_min_tri_angle)
+    mapper_options.init_min_tri_angle = float(mapper_init_min_tri_angle)
+    mapper_options.max_reg_trials = max(1, int(mapper_max_reg_trials))
+    mapper_options.init_max_reg_trials = max(1, int(init_num_trials))
+
+    pycolmap.extract_features(
+        database_path=str(db_path),
+        image_path=str(image_dir),
+        image_names=image_names or [],
+        camera_mode=pycolmap.CameraMode.SINGLE,
+        camera_model="PINHOLE",
+        reader_options=reader_options,
+        extraction_options=extraction_options,
+    )
+
+    if matcher == "sequential":
+        pycolmap.match_sequential(
+            database_path=str(db_path),
+            matching_options=matching_options,
+            pairing_options=pairing_options,
+        )
+    else:
+        pycolmap.match_exhaustive(database_path=str(db_path), matching_options=matching_options)
+
+    maps = pycolmap.incremental_mapping(
+        database_path=str(db_path),
+        image_path=str(image_dir),
+        output_path=str(sparse_dir),
+        options=mapping_options,
+    )
+
+    if not maps:
+        raise RuntimeError(f"pycolmap mapping did not produce a sparse model for {image_dir}")
+
+    best_idx, best_map = max(
+        maps.items(),
+        key=lambda item: (item[1].num_reg_images(), item[1].num_points3D()),
+    )
+    text_dir = scene_out_dir / "model_txt"
+    text_dir.mkdir(parents=True, exist_ok=True)
+    best_map.write_text(str(text_dir))
 
     return ColmapModel(
         cameras_txt=text_dir / "cameras.txt",
@@ -327,7 +583,14 @@ def save_lookup_artifacts(scene_out_dir: Path, points3d: Dict[int, dict], images
     )
 
 
-def read_ply_vertices_xyz(path: Path) -> np.ndarray:
+def sample_points_uniform(points: np.ndarray, max_points: int) -> np.ndarray:
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+    indices = np.linspace(0, len(points) - 1, num=max_points, dtype=np.int64)
+    return points[indices]
+
+
+def read_ply_vertices_xyz(path: Path, max_points: int = 0) -> np.ndarray:
     with path.open("rb") as f:
         header_lines = []
         while True:
@@ -383,15 +646,18 @@ def read_ply_vertices_xyz(path: Path) -> np.ndarray:
 
         if fmt == "ascii":
             pts = []
-            for _ in range(vertex_count):
+            step = max(1, int(np.ceil(vertex_count / max_points))) if max_points > 0 and vertex_count > max_points else 1
+            for idx in range(vertex_count):
                 parts = f.readline().decode("ascii", errors="ignore").strip().split()
                 if len(parts) < len(vertex_props):
+                    continue
+                if idx % step != 0:
                     continue
                 x = float(parts[xyz_indices["x"]])
                 y = float(parts[xyz_indices["y"]])
                 z = float(parts[xyz_indices["z"]])
                 pts.append([x, y, z])
-            return np.asarray(pts, dtype=np.float64)
+            return sample_points_uniform(np.asarray(pts, dtype=np.float64), max_points)
 
         if fmt not in ("binary_little_endian", "binary_big_endian"):
             raise RuntimeError(f"Unsupported PLY format '{fmt}' in {path}")
@@ -399,12 +665,19 @@ def read_ply_vertices_xyz(path: Path) -> np.ndarray:
         endian = "<" if fmt == "binary_little_endian" else ">"
         struct_fmt = endian + "".join(type_map[t] for t, _ in vertex_props)
         row_size = struct.calcsize(struct_fmt)
+        vertex_data_offset = f.tell()
+
+        if max_points > 0 and vertex_count > max_points:
+            target_indices = np.linspace(0, vertex_count - 1, num=max_points, dtype=np.int64)
+        else:
+            target_indices = np.arange(vertex_count, dtype=np.int64)
 
         pts = []
-        for _ in range(vertex_count):
+        for vertex_idx in target_indices.tolist():
+            f.seek(vertex_data_offset + int(vertex_idx) * row_size)
             row = f.read(row_size)
             if len(row) != row_size:
-                break
+                continue
             vals = struct.unpack(struct_fmt, row)
             pts.append([
                 float(vals[xyz_indices["x"]]),
@@ -472,6 +745,189 @@ def load_custom_metrics(path: Optional[Path]) -> Dict[str, dict]:
         return json.load(f)
 
 
+def ordered_colmap_camera_centers(images: Dict[int, dict]) -> Tuple[np.ndarray, Dict[str, List[float]]]:
+    ordered = sorted(images.values(), key=lambda item: frame_sort_key(item["name"]))
+    centers = []
+    pose_lookup = {}
+    for item in ordered:
+        R = qvec_to_rotmat(item["qvec"])
+        C = (-R.T @ item["tvec"].reshape(3, 1)).reshape(-1)
+        centers.append(C)
+        pose_lookup[item["name"]] = C.tolist()
+
+    if not centers:
+        return np.empty((0, 3), dtype=np.float64), pose_lookup
+    return np.asarray(centers, dtype=np.float64), pose_lookup
+
+
+def ordered_custom_camera_centers(sfm_map) -> Tuple[np.ndarray, Dict[str, List[float]]]:
+    ordered_ids = sorted(
+        [idx for idx in sfm_map.frame_indices if sfm_map.registered_cameras.get(idx, (None, None))[0] is not None]
+    )
+    centers = []
+    pose_lookup = {}
+    for idx in ordered_ids:
+        R, t = sfm_map.registered_cameras[idx]
+        C = (-R.T @ t).reshape(-1)
+        name = f"frame_{idx:04d}.png"
+        centers.append(C)
+        pose_lookup[name] = C.tolist()
+
+    if not centers:
+        return np.empty((0, 3), dtype=np.float64), pose_lookup
+    return np.asarray(centers, dtype=np.float64), pose_lookup
+
+
+def normalize_for_visualization(points: np.ndarray, cameras: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    stacks = []
+    if len(points) > 0:
+        stacks.append(points)
+    if len(cameras) > 0:
+        stacks.append(cameras)
+    if not stacks:
+        return points.copy(), cameras.copy()
+
+    merged = np.vstack(stacks)
+    center = np.mean(merged, axis=0, keepdims=True)
+    shifted_points = points - center if len(points) > 0 else points.copy()
+    shifted_cameras = cameras - center if len(cameras) > 0 else cameras.copy()
+
+    scale = float(np.max(np.linalg.norm(np.vstack([arr for arr in [shifted_points, shifted_cameras] if len(arr) > 0]), axis=1)))
+    scale = max(scale, 1e-12)
+    return shifted_points / scale, shifted_cameras / scale
+
+
+def annotate_sparse_frames(ax, camera_centers: np.ndarray, labels: List[str], step: int) -> None:
+    if len(camera_centers) == 0:
+        return
+    step = max(1, int(step))
+    for idx in range(0, len(camera_centers), step):
+        ax.text(camera_centers[idx, 0], camera_centers[idx, 2], labels[idx], fontsize=6, alpha=0.8)
+
+
+def save_trajectory_comparison(scene_out_dir: Path, scene: str, custom: PipelineSummary, colmap: PipelineSummary) -> Path:
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig.suptitle(f"Task 5 - Trajectory Comparison ({scene.title()}, Top-Down View)", fontsize=18, fontweight="bold")
+
+    panels = [
+        (axes[0], custom, "Your Pipeline", "#e53935"),
+        (axes[1], colmap, "COLMAP", "#e53935"),
+    ]
+
+    for ax, summary, title, color in panels:
+        _, cams = normalize_for_visualization(np.empty((0, 3), dtype=np.float64), summary.camera_centers)
+        labels = sorted(summary.pose_lookup.keys(), key=frame_sort_key)
+        ax.plot(cams[:, 0], cams[:, 2], color=color, linewidth=1.6, alpha=0.95, label="Trajectory")
+        ax.scatter(cams[:, 0], cams[:, 2], color=color, s=18)
+        if len(cams) > 0:
+            ax.scatter(cams[0, 0], cams[0, 2], color="green", s=90, label="Start", zorder=5)
+            ax.scatter(cams[-1, 0], cams[-1, 2], color="blue", s=90, label="End", zorder=5)
+            annotate_sparse_frames(ax, cams, labels, max(1, len(labels) // 12))
+        ax.set_title(f"{title} - {summary.num_cameras} cameras", fontsize=16)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Z (depth)")
+        ax.grid(True, linestyle="--", alpha=0.35)
+        ax.legend(loc="upper right")
+
+    out_path = scene_out_dir / "trajectory_comparison.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def save_reconstruction_comparison(scene_out_dir: Path, scene: str, custom: PipelineSummary, colmap: PipelineSummary) -> Path:
+    fig = plt.figure(figsize=(16, 8))
+    fig.suptitle(f"Task 5 - 3D Reconstruction Comparison ({scene.title()})", fontsize=18, fontweight="bold")
+
+    panels = [
+        (fig.add_subplot(1, 2, 1, projection="3d"), custom, "Custom Pipeline", "#6baed6", "orange"),
+        (fig.add_subplot(1, 2, 2, projection="3d"), colmap, "COLMAP", "#64d98b", "crimson"),
+    ]
+
+    for ax, summary, title, pt_color, cam_color in panels:
+        pts, cams = normalize_for_visualization(summary.points, summary.camera_centers)
+        if len(pts) > 0:
+            step = max(1, len(pts) // 12000)
+            ax.scatter(pts[::step, 0], pts[::step, 1], pts[::step, 2], s=1, alpha=0.35, c=pt_color, label=f"{summary.num_points} pts")
+        if len(cams) > 0:
+            ax.scatter(cams[:, 0], cams[:, 1], cams[:, 2], s=22, c=cam_color, label="cameras")
+            ax.plot(cams[:, 0], cams[:, 1], cams[:, 2], c=cam_color, linewidth=1.3, alpha=0.85)
+        ax.set_title(f"{title} - {summary.num_cameras} cameras, {summary.num_points} pts", fontsize=14)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.legend(loc="upper left")
+
+    out_path = scene_out_dir / "reconstruction_comparison.png"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def run_custom_pipeline(scene: str, scene_frames: Path, gt_pts: np.ndarray, args, scene_out_dir: Path) -> PipelineSummary:
+    from task1 import get_camera_intrinsics
+    from task3 import run_incremental_sfm
+
+    image_paths = sorted(scene_frames.glob("*.png")) + sorted(scene_frames.glob("*.jpg")) + sorted(scene_frames.glob("*.jpeg"))
+    if args.max_images_per_scene > 0:
+        image_paths = image_paths[:args.max_images_per_scene]
+    if len(image_paths) < 2:
+        raise RuntimeError(f"Need at least 2 images for custom pipeline in {scene_frames}")
+
+    # Downsample frames to reasonable density for incremental SfM
+    # Target: ~15-20 frames maximum to ensure good overlap and prevent PnP failures
+    frame_interval = max(1, len(image_paths) // 16)
+    if frame_interval > 1:
+        image_paths = image_paths[::frame_interval]
+    
+    img0 = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
+    if img0 is None:
+        raise RuntimeError(f"Could not read first custom frame: {image_paths[0]}")
+    h, w = img0.shape[:2]
+    K = get_camera_intrinsics((h, w))
+
+    sfm_map = run_incremental_sfm(
+        [str(p) for p in image_paths],
+        K,
+        live_plot=False,
+        plot_every=max(1, int(args.custom_plot_every)),
+    )
+
+    points = np.asarray(sfm_map.points_3d, dtype=np.float64) if sfm_map.points_3d else np.empty((0, 3), dtype=np.float64)
+    cameras, pose_lookup = ordered_custom_camera_centers(sfm_map)
+    mean_reproj = float(sfm_map.compute_global_reprojection_error()) if len(points) > 0 else float("nan")
+    cd = chamfer_distance(points, gt_pts)
+
+    summary = PipelineSummary(
+        name="custom",
+        points=points,
+        camera_centers=cameras,
+        mean_reprojection_error=mean_reproj,
+        chamfer_distance=cd,
+        num_points=int(len(points)),
+        num_cameras=int(len(cameras)),
+        pose_lookup=pose_lookup,
+    )
+
+    with (scene_out_dir / "custom_pipeline_metrics.json").open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "scene": scene,
+                "num_registered_cameras": summary.num_cameras,
+                "num_points": summary.num_points,
+                "mean_reprojection_error": summary.mean_reprojection_error,
+                "chamfer_distance": summary.chamfer_distance,
+                "poses": summary.pose_lookup,
+            },
+            f,
+            indent=2,
+        )
+
+    return summary
+
+
 def compare_with_custom(scene: str, scene_metrics: dict, custom_metrics: Dict[str, dict]) -> dict:
     c = custom_metrics.get(scene, {})
 
@@ -494,21 +950,124 @@ def compare_with_custom(scene: str, scene_metrics: dict, custom_metrics: Dict[st
     return out
 
 
+def build_colmap_summary(images: Dict[int, dict], points3d: Dict[int, dict], mean_reproj: float, cd: float) -> PipelineSummary:
+    points = np.stack([v["xyz"] for v in points3d.values()], axis=0) if points3d else np.empty((0, 3), dtype=np.float64)
+    cameras, pose_lookup = ordered_colmap_camera_centers(images)
+    return PipelineSummary(
+        name="colmap",
+        points=points,
+        camera_centers=cameras,
+        mean_reprojection_error=float(mean_reproj),
+        chamfer_distance=float(cd),
+        num_points=int(len(points)),
+        num_cameras=int(len(cameras)),
+        pose_lookup=pose_lookup,
+    )
+
+
 def run_scene(
     scene: str,
     args,
-    colmap_bin: str,
+    colmap_bin: Optional[str],
     custom_metrics: Dict[str, dict],
 ) -> dict:
     split_a_dir = Path(args.dataset_root) / "Split_A"
     gt_dir = Path(args.dataset_root) / "GT_ply_files"
     task5_root = Path(args.output_root)
+    scene_out_dir = task5_root / scene
 
     frames_root = task5_root / "frames"
-    scene_frames = ensure_frames_for_scene(scene, split_a_dir, frames_root, args.frame_stride)
+    scene_frames = ensure_frames_for_scene(
+        scene,
+        split_a_dir,
+        frames_root,
+        args.frame_stride,
+        args.max_images_per_scene,
+        args.force_extract_frames,
+    )
+    working_frames = create_resized_subset(
+        scene_frames,
+        scene_out_dir / "working_frames",
+        args.max_images_per_scene,
+        args.working_max_width,
+    )
+    selected_names = select_image_names(working_frames, args.max_images_per_scene)
 
-    scene_out_dir = task5_root / scene
-    model = build_colmap_map(colmap_bin, scene_frames, scene_out_dir, args.matcher)
+    if args.backend == "pycolmap":
+        try:
+            model = build_colmap_map_pycolmap(
+                working_frames,
+                scene_out_dir,
+                args.matcher,
+                args.feature_threads,
+                args.max_image_size,
+                args.max_num_features,
+                args.sequential_overlap,
+                args.colmap_use_gpu,
+                args.min_num_matches,
+                args.init_num_trials,
+                args.mapper_init_min_num_inliers,
+                args.mapper_abs_pose_min_num_inliers,
+                args.mapper_abs_pose_min_inlier_ratio,
+                args.mapper_init_max_error,
+                args.mapper_abs_pose_max_error,
+                args.mapper_filter_max_reproj_error,
+                args.mapper_filter_min_tri_angle,
+                args.mapper_ba_local_min_tri_angle,
+                args.mapper_init_min_tri_angle,
+                args.mapper_max_reg_trials,
+                selected_names,
+            )
+        except RuntimeError as exc:
+            if "did not produce a sparse model" not in str(exc) or args.matcher != "sequential":
+                raise
+            print("Sequential matching failed to initialize COLMAP; retrying once with exhaustive matching.")
+            model = build_colmap_map_pycolmap(
+                working_frames,
+                scene_out_dir,
+                "exhaustive",
+                args.feature_threads,
+                args.max_image_size,
+                args.max_num_features,
+                args.sequential_overlap,
+                args.colmap_use_gpu,
+                args.min_num_matches,
+                args.init_num_trials,
+                args.mapper_init_min_num_inliers,
+                args.mapper_abs_pose_min_num_inliers,
+                args.mapper_abs_pose_min_inlier_ratio,
+                args.mapper_init_max_error,
+                args.mapper_abs_pose_max_error,
+                args.mapper_filter_max_reproj_error,
+                args.mapper_filter_min_tri_angle,
+                args.mapper_ba_local_min_tri_angle,
+                args.mapper_init_min_tri_angle,
+                args.mapper_max_reg_trials,
+                selected_names,
+            )
+    else:
+        if not colmap_bin:
+            raise RuntimeError("COLMAP backend selected but no colmap binary is available.")
+        model = build_colmap_map_cli(
+            colmap_bin,
+            working_frames,
+            scene_out_dir,
+            args.matcher,
+            args.colmap_use_gpu,
+            args.sequential_overlap,
+            args.min_num_matches,
+            args.init_num_trials,
+            args.mapper_init_min_num_inliers,
+            args.mapper_abs_pose_min_num_inliers,
+            args.mapper_abs_pose_min_inlier_ratio,
+            args.mapper_init_max_error,
+            args.mapper_abs_pose_max_error,
+            args.mapper_filter_max_reproj_error,
+            args.mapper_filter_min_tri_angle,
+            args.mapper_ba_local_min_tri_angle,
+            args.mapper_init_min_tri_angle,
+            args.mapper_max_reg_trials,
+        )
 
     images = parse_images_txt(model.images_txt)
     points3d = parse_points3d_txt(model.points3d_txt)
@@ -516,18 +1075,44 @@ def run_scene(
     db_path = scene_out_dir / "database.db"
     descriptors_by_image = load_colmap_descriptors(db_path)
     desc, point_ids, _point_repr = build_descriptor_lookup(points3d, descriptors_by_image)
+    del descriptors_by_image
+    gc.collect()
 
     save_lookup_artifacts(scene_out_dir, points3d, images, desc, point_ids)
 
     rec_pts = np.stack([v["xyz"] for v in points3d.values()], axis=0) if points3d else np.empty((0, 3), dtype=np.float64)
     gt_name = "Meetingroom.ply" if scene == "meetingroom" else f"{scene.capitalize()}.ply"
     gt_path = gt_dir / gt_name
-    gt_pts = read_ply_vertices_xyz(gt_path)
+    gt_pts = read_ply_vertices_xyz(gt_path, args.gt_max_points)
 
     mean_reproj = float(np.mean([p["error"] for p in points3d.values()])) if points3d else float("nan")
     cd = chamfer_distance(rec_pts, gt_pts)
+    colmap_summary = build_colmap_summary(images, points3d, mean_reproj, cd)
 
     save_qualitative_plot(scene_out_dir, rec_pts, gt_pts, f"Task 5 Reconstruction - {scene}")
+
+    custom_summary = None
+    custom_warning = None
+    if not args.skip_custom_pipeline:
+        try:
+            custom_summary = run_custom_pipeline(scene, working_frames, gt_pts, args, scene_out_dir)
+        except Exception as exc:
+            custom_warning = f"Custom pipeline failed: {exc}"
+            print(custom_warning)
+            gc.collect()
+
+    trajectory_plot = None
+    reconstruction_plot = None
+    if custom_summary is not None:
+        try:
+            trajectory_plot = save_trajectory_comparison(scene_out_dir, scene, custom_summary, colmap_summary)
+            reconstruction_plot = save_reconstruction_comparison(scene_out_dir, scene, custom_summary, colmap_summary)
+        except Exception as exc:
+            custom_warning = f"Comparison plotting failed: {exc}"
+            print(custom_warning)
+            trajectory_plot = None
+            reconstruction_plot = None
+            gc.collect()
 
     metrics = {
         "scene": scene,
@@ -541,10 +1126,27 @@ def run_scene(
             "points3d": str(scene_out_dir / "points3d.json"),
             "descriptor_lookup": str(scene_out_dir / "descriptor_lookup.npz"),
             "qualitative_plot": str(scene_out_dir / "qualitative_reconstruction.png"),
+            "trajectory_comparison": str(trajectory_plot) if trajectory_plot else None,
+            "reconstruction_comparison": str(reconstruction_plot) if reconstruction_plot else None,
+            "custom_pipeline_metrics": str(scene_out_dir / "custom_pipeline_metrics.json") if custom_summary is not None else None,
         },
+        "warnings": [custom_warning] if custom_warning else [],
     }
 
-    metrics["comparison_with_custom_pipeline"] = compare_with_custom(scene, metrics, custom_metrics)
+    if custom_summary is not None:
+        metrics["comparison_with_custom_pipeline"] = {
+            "pose_comparison": "top-down trajectory and 3D reconstruction comparison plots generated",
+            "reprojection_error_custom": custom_summary.mean_reprojection_error,
+            "reprojection_error_colmap": colmap_summary.mean_reprojection_error,
+            "num_points_custom": custom_summary.num_points,
+            "num_points_colmap": colmap_summary.num_points,
+            "num_cameras_custom": custom_summary.num_cameras,
+            "num_cameras_colmap": colmap_summary.num_cameras,
+            "chamfer_custom": custom_summary.chamfer_distance,
+            "chamfer_colmap": colmap_summary.chamfer_distance,
+        }
+    else:
+        metrics["comparison_with_custom_pipeline"] = compare_with_custom(scene, metrics, custom_metrics)
 
     with (scene_out_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
@@ -558,7 +1160,31 @@ def main() -> None:
     parser.add_argument("--output-root", default="task5_colmap", help="Output directory for Task 5 artifacts")
     parser.add_argument("--scenes", nargs="*", default=SCENES, help="Scenes to process: barn meetingroom truck")
     parser.add_argument("--frame-stride", type=int, default=25, help="Frame stride used only if scene frame folders are missing")
+    parser.add_argument("--force-extract-frames", action="store_true", help="Ignore existing extracted folders and rebuild frames from the source video")
+    parser.add_argument("--max-images-per-scene", type=int, default=120, help="Cap number of images processed per scene (<=0 disables cap)")
+    parser.add_argument("--working-max-width", type=int, default=960, help="Resize working frames to this width for faster Task 5 runs")
     parser.add_argument("--matcher", choices=["sequential", "exhaustive"], default="sequential", help="COLMAP matcher type")
+    parser.add_argument("--sequential-overlap", type=int, default=20, help="How many neighboring frames COLMAP matches in sequential mode")
+    parser.add_argument("--backend", choices=["pycolmap", "colmap"], default="pycolmap", help="SfM backend")
+    parser.add_argument("--colmap-use-gpu", action="store_true", help="Enable COLMAP/pycolmap GPU feature extraction and matching when available")
+    parser.add_argument("--feature-threads", type=int, default=2, help="Threads for feature extraction/matching")
+    parser.add_argument("--max-image-size", type=int, default=960, help="Max image size used by pycolmap feature extraction")
+    parser.add_argument("--max-num-features", type=int, default=4000, help="Max SIFT features per image for pycolmap")
+    parser.add_argument("--min-num-matches", type=int, default=8, help="Relaxed minimum number of matches required by the COLMAP mapper")
+    parser.add_argument("--init-num-trials", type=int, default=400, help="How many initialization attempts COLMAP makes before giving up")
+    parser.add_argument("--mapper-init-min-num-inliers", type=int, default=40, help="Minimum inliers required for choosing the initial image pair")
+    parser.add_argument("--mapper-abs-pose-min-num-inliers", type=int, default=24, help="Minimum PnP inliers required to register a new image")
+    parser.add_argument("--mapper-abs-pose-min-inlier-ratio", type=float, default=0.12, help="Minimum inlier ratio required to register a new image")
+    parser.add_argument("--mapper-init-max-error", type=float, default=8.0, help="Relaxed initialization reprojection error threshold")
+    parser.add_argument("--mapper-abs-pose-max-error", type=float, default=14.0, help="Relaxed absolute pose reprojection error threshold")
+    parser.add_argument("--mapper-filter-max-reproj-error", type=float, default=8.0, help="Relaxed reprojection error used when filtering 3D points")
+    parser.add_argument("--mapper-filter-min-tri-angle", type=float, default=0.5, help="Min triangulation angle (degrees) for keeping 3D points (default COLMAP=1.5)")
+    parser.add_argument("--mapper-ba-local-min-tri-angle", type=float, default=2.0, help="Min triangulation angle for local BA (default COLMAP=6.0)")
+    parser.add_argument("--mapper-init-min-tri-angle", type=float, default=8.0, help="Min triangulation angle for initialization pair (default COLMAP=16.0)")
+    parser.add_argument("--mapper-max-reg-trials", type=int, default=5, help="Max times COLMAP retries registering each image (default COLMAP=3)")
+    parser.add_argument("--gt-max-points", type=int, default=200000, help="Max GT points loaded from each mesh for Chamfer/plotting (<=0 loads all)")
+    parser.add_argument("--skip-custom-pipeline", action="store_true", help="Skip running the custom pipeline comparison")
+    parser.add_argument("--custom-plot-every", type=int, default=10, help="Plot cadence forwarded to custom pipeline when it runs")
     parser.add_argument("--colmap-bin", default=None, help="Path to colmap executable if not in PATH")
     parser.add_argument(
         "--custom-metrics-json",
@@ -577,7 +1203,11 @@ def main() -> None:
 
     custom_metrics = load_custom_metrics(Path(args.custom_metrics_json) if args.custom_metrics_json else None)
 
-    colmap_bin = find_colmap_binary(args.colmap_bin)
+    colmap_bin = None
+    if args.backend == "colmap":
+        colmap_bin = find_colmap_binary(args.colmap_bin)
+    elif pycolmap is None:
+        raise RuntimeError("--backend pycolmap selected but pycolmap is unavailable.")
 
     all_metrics = {}
     for scene in scenes:

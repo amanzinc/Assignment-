@@ -8,3 +8,21 @@ frame1.png
 frame2.png
 extract_frames.py
 __MACOSX/
+
+# Large frame extraction directories
+split_a_*_frames/
+task3_optimized_frames/
+test_frames/
+
+# Task 5 output directories (contain large files)
+task5_*/
+
+# Debug directories
+task5_dbg/
+task5_dbg_truck/
+
+# Log files
+*.log
+
+# VS Code
+.vscode/

@@ -569,7 +569,10 @@ def run_incremental_sfm(image_files, K, live_plot=True, plot_every=1):
         plt.ioff()
     return sfm_map
 
-def visualize_map(sfm_map):
+def visualize_map(sfm_map, prefix='task3'):
+    import gc
+    plt.close('all')
+    gc.collect()
     pts = np.array(sfm_map.points_3d)
     registered = [idx for idx in sfm_map.frame_indices
                   if sfm_map.registered_cameras.get(idx, (None, None))[0] is not None]
@@ -605,11 +608,15 @@ def visualize_map(sfm_map):
         _set_equal_3d_limits(ax, final_bounds[0], final_bounds[1])
 
     plt.tight_layout()
-    plt.savefig('task3_map.png', dpi=140)
-    plt.savefig('task3_trajectory.png', dpi=140)
-    print("Saved trajectory visualization to task3_map.png and task3_trajectory.png")
+    plt.savefig(f'{prefix}_map.png', dpi=100)
+    plt.savefig(f'{prefix}_trajectory.png', dpi=100)
+    plt.close('all')
+    print(f"Saved trajectory visualization to {prefix}_map.png and {prefix}_trajectory.png")
 
-def visualize_metrics(sfm_map, err_threshold=2.0):
+def visualize_metrics(sfm_map, err_threshold=2.0, prefix='task3'):
+    import gc
+    plt.close('all')
+    gc.collect()
     frames = np.array(sfm_map.stats_frames, dtype=int)
     cams = np.array(sfm_map.stats_registered_cameras, dtype=float)
     pts = np.array(sfm_map.stats_points, dtype=float)
@@ -638,8 +645,9 @@ def visualize_metrics(sfm_map, err_threshold=2.0):
     axes[2].legend(loc='lower right')
 
     plt.tight_layout()
-    plt.savefig('task3_metrics.png', dpi=140)
-    print("Saved metrics dashboard to task3_metrics.png")
+    plt.savefig(f'{prefix}_metrics.png', dpi=100)
+    plt.close('all')
+    print(f"Saved metrics dashboard to {prefix}_metrics.png")
 
 def main():
     parser = argparse.ArgumentParser(description="Task 3: Incremental Mapping")
@@ -649,6 +657,7 @@ def main():
     parser.add_argument("--optimized-dir", default="task3_optimized_frames", help="Where resized selected frames are written")
     parser.add_argument("--no-live-plot", action="store_true", help="Disable real-time incremental map visualization")
     parser.add_argument("--plot-every", type=int, default=1, help="Update live map every N processed frames")
+    parser.add_argument("--output-prefix", default="task3", help="Prefix for all saved output images (default: task3)")
     args = parser.parse_args()
 
     # Load images
@@ -686,9 +695,8 @@ def main():
         plot_every=max(1, args.plot_every)
     )
     
-    visualize_map(sfm_map)
-    visualize_metrics(sfm_map, err_threshold=2.0)
-    plt.show()
+    visualize_map(sfm_map, prefix=args.output_prefix)
+    visualize_metrics(sfm_map, err_threshold=2.0, prefix=args.output_prefix)
     
     # Save map? The prompt doesn't explicitly ask to save to file, but we should make it reusable for Task 4
     # We'll just run it as a script for now. 
