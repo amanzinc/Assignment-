@@ -68,6 +68,7 @@ def ensure_frames_for_scene(
     stride: int,
     max_output_frames: int = 0,
     force_extract_frames: bool = False,
+    resize_width: int = 0,
 ) -> Path:
     # Reuse pre-extracted frames if they already exist in workspace root.
     if not force_extract_frames:
@@ -77,7 +78,8 @@ def ensure_frames_for_scene(
             if len(existing_ws) >= 2:
                 return workspace_frames
 
-    dir_suffix = f"split_a_{scene}_frames_s{max(1, int(stride))}"
+    width_suffix = f"_w{resize_width}" if resize_width > 0 else ""
+    dir_suffix = f"split_a_{scene}_frames_s{max(1, int(stride))}{width_suffix}"
     out_dir = frames_root / dir_suffix
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -105,6 +107,13 @@ def ensure_frames_for_scene(
             frame_idx += 1
             continue
 
+        # Resize during extraction to avoid writing huge 4K PNGs
+        if resize_width > 0:
+            h, w = frame.shape[:2]
+            if w > resize_width:
+                scale = resize_width / float(w)
+                frame = cv2.resize(frame, (resize_width, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+
         out_name = out_dir / f"frame_{frame_idx:04d}.png"
         cv2.imwrite(str(out_name), frame)
         written += 1
@@ -131,6 +140,10 @@ def create_resized_subset(image_dir: Path, output_dir: Path, max_images: int, ma
 
     for old_file in output_dir.glob("*.png"):
         old_file.unlink()
+    for old_file in output_dir.glob("*.jpg"):
+        old_file.unlink()
+    for old_file in output_dir.glob("*.jpeg"):
+        old_file.unlink()
 
     images = sorted(image_dir.glob("*.png")) + sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.jpeg"))
     if max_images > 0:
@@ -148,8 +161,9 @@ def create_resized_subset(image_dir: Path, output_dir: Path, max_images: int, ma
             new_h = max(1, int(round(h * scale)))
             img = cv2.resize(img, (max_width, new_h), interpolation=cv2.INTER_AREA)
 
-        out_path = output_dir / f"frame_{idx:04d}.png"
-        cv2.imwrite(str(out_path), img)
+        # JPEG working frames keep Task 5 output size and I/O lower than PNG.
+        out_path = output_dir / f"frame_{idx:04d}.jpg"
+        cv2.imwrite(str(out_path), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
         written += 1
 
     if written < 2:
@@ -164,6 +178,14 @@ def frame_sort_key(name: str) -> Tuple[int, str]:
     if digits:
         return int(digits), name
     return 10**9, name
+
+
+def resolve_feature_threads(requested_threads: int) -> int:
+    # Auto mode (<=0): use half CPU cores capped at 4 for laptop stability.
+    if requested_threads <= 0:
+        cpu = os.cpu_count() or 2
+        return max(1, min(4, cpu // 2 if cpu > 1 else 1))
+    return max(1, int(requested_threads))
 
 
 def find_colmap_binary(explicit_path: Optional[str]) -> str:
@@ -870,30 +892,66 @@ def run_custom_pipeline(scene: str, scene_frames: Path, gt_pts: np.ndarray, args
     from task1 import get_camera_intrinsics
     from task3 import run_incremental_sfm
 
-    image_paths = sorted(scene_frames.glob("*.png")) + sorted(scene_frames.glob("*.jpg")) + sorted(scene_frames.glob("*.jpeg"))
+    image_paths_all = sorted(scene_frames.glob("*.png")) + sorted(scene_frames.glob("*.jpg")) + sorted(scene_frames.glob("*.jpeg"))
     if args.max_images_per_scene > 0:
-        image_paths = image_paths[:args.max_images_per_scene]
-    if len(image_paths) < 2:
+        image_paths_all = image_paths_all[:args.max_images_per_scene]
+    if len(image_paths_all) < 2:
         raise RuntimeError(f"Need at least 2 images for custom pipeline in {scene_frames}")
 
-    # Downsample frames to reasonable density for incremental SfM
-    # Target: ~15-20 frames maximum to ensure good overlap and prevent PnP failures
-    frame_interval = max(1, len(image_paths) // 16)
-    if frame_interval > 1:
-        image_paths = image_paths[::frame_interval]
-    
-    img0 = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
-    if img0 is None:
-        raise RuntimeError(f"Could not read first custom frame: {image_paths[0]}")
-    h, w = img0.shape[:2]
-    K = get_camera_intrinsics((h, w))
+    # Keep substantially more frames for custom SfM than before.
+    # Previous fixed downsample to ~16 frames could collapse registration to very few cameras.
+    # custom_max_images <= 0 means: do not cap custom images.
+    if int(args.custom_max_images) <= 0:
+        target_custom_images = len(image_paths_all)
+    else:
+        target_custom_images = max(2, int(args.custom_max_images))
+    base_interval = max(1, int(np.ceil(len(image_paths_all) / float(target_custom_images))))
 
-    sfm_map = run_incremental_sfm(
-        [str(p) for p in image_paths],
-        K,
-        live_plot=False,
-        plot_every=max(1, int(args.custom_plot_every)),
-    )
+    # Retry with denser sampling if camera registration is too low.
+    retry_intervals = [base_interval]
+    if base_interval > 1:
+        retry_intervals.append(max(1, base_interval // 2))
+    if retry_intervals[-1] != 1:
+        retry_intervals.append(1)
+
+    best_sfm_map = None
+    best_registered = -1
+
+    for interval in retry_intervals:
+        image_paths = image_paths_all[::interval]
+        if len(image_paths) < 2:
+            continue
+
+        print(
+            f"Custom pipeline retry: interval={interval} "
+            f"frames={len(image_paths)} target_min_cams={int(args.custom_min_registered_cameras)}"
+        )
+
+        img0 = cv2.imread(str(image_paths[0]), cv2.IMREAD_COLOR)
+        if img0 is None:
+            raise RuntimeError(f"Could not read first custom frame: {image_paths[0]}")
+        h, w = img0.shape[:2]
+        K = get_camera_intrinsics((h, w))
+
+        sfm_map_try = run_incremental_sfm(
+            [str(p) for p in image_paths],
+            K,
+            live_plot=False,
+            plot_every=max(1, int(args.custom_plot_every)),
+        )
+
+        reg_try = sum(1 for idx in sfm_map_try.frame_indices if sfm_map_try.registered_cameras.get(idx, (None, None))[0] is not None)
+        if reg_try > best_registered:
+            best_registered = reg_try
+            best_sfm_map = sfm_map_try
+
+        if reg_try >= int(args.custom_min_registered_cameras):
+            break
+
+    if best_sfm_map is None:
+        raise RuntimeError("Custom pipeline did not produce a valid reconstruction.")
+    
+    sfm_map = best_sfm_map
 
     points = np.asarray(sfm_map.points_3d, dtype=np.float64) if sfm_map.points_3d else np.empty((0, 3), dtype=np.float64)
     cameras, pose_lookup = ordered_custom_camera_centers(sfm_map)
@@ -984,6 +1042,7 @@ def run_scene(
         args.frame_stride,
         args.max_images_per_scene,
         args.force_extract_frames,
+        args.working_max_width,
     )
     working_frames = create_resized_subset(
         scene_frames,
@@ -1161,13 +1220,13 @@ def main() -> None:
     parser.add_argument("--scenes", nargs="*", default=SCENES, help="Scenes to process: barn meetingroom truck")
     parser.add_argument("--frame-stride", type=int, default=25, help="Frame stride used only if scene frame folders are missing")
     parser.add_argument("--force-extract-frames", action="store_true", help="Ignore existing extracted folders and rebuild frames from the source video")
-    parser.add_argument("--max-images-per-scene", type=int, default=120, help="Cap number of images processed per scene (<=0 disables cap)")
+    parser.add_argument("--max-images-per-scene", type=int, default=0, help="Cap number of images processed per scene (<=0 disables cap)")
     parser.add_argument("--working-max-width", type=int, default=960, help="Resize working frames to this width for faster Task 5 runs")
     parser.add_argument("--matcher", choices=["sequential", "exhaustive"], default="sequential", help="COLMAP matcher type")
     parser.add_argument("--sequential-overlap", type=int, default=20, help="How many neighboring frames COLMAP matches in sequential mode")
     parser.add_argument("--backend", choices=["pycolmap", "colmap"], default="pycolmap", help="SfM backend")
     parser.add_argument("--colmap-use-gpu", action="store_true", help="Enable COLMAP/pycolmap GPU feature extraction and matching when available")
-    parser.add_argument("--feature-threads", type=int, default=2, help="Threads for feature extraction/matching")
+    parser.add_argument("--feature-threads", type=int, default=0, help="Threads for feature extraction/matching (<=0 auto-selects a safe value)")
     parser.add_argument("--max-image-size", type=int, default=960, help="Max image size used by pycolmap feature extraction")
     parser.add_argument("--max-num-features", type=int, default=4000, help="Max SIFT features per image for pycolmap")
     parser.add_argument("--min-num-matches", type=int, default=8, help="Relaxed minimum number of matches required by the COLMAP mapper")
@@ -1185,6 +1244,8 @@ def main() -> None:
     parser.add_argument("--gt-max-points", type=int, default=200000, help="Max GT points loaded from each mesh for Chamfer/plotting (<=0 loads all)")
     parser.add_argument("--skip-custom-pipeline", action="store_true", help="Skip running the custom pipeline comparison")
     parser.add_argument("--custom-plot-every", type=int, default=10, help="Plot cadence forwarded to custom pipeline when it runs")
+    parser.add_argument("--custom-max-images", type=int, default=0, help="Max images used by custom pipeline (<=0 means no cap)")
+    parser.add_argument("--custom-min-registered-cameras", type=int, default=12, help="Retry custom pipeline with denser sampling until this camera count is reached")
     parser.add_argument("--colmap-bin", default=None, help="Path to colmap executable if not in PATH")
     parser.add_argument(
         "--custom-metrics-json",
@@ -1192,6 +1253,8 @@ def main() -> None:
         help="Optional JSON with custom pipeline metrics for direct comparison",
     )
     args = parser.parse_args()
+    args.feature_threads = resolve_feature_threads(args.feature_threads)
+    print(f"Task 5 feature threads: {args.feature_threads}")
 
     scenes = [s.lower() for s in args.scenes]
     bad = [s for s in scenes if s not in SCENES]
